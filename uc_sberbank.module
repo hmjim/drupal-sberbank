@@ -1,0 +1,269 @@
+<?php
+
+/**
+ * Implements hook_permission().
+ */
+function uc_sberbank_permission() {
+	return array(
+		'administer sberbank' => array(
+			'title' => t('Administer Sberbank Payment'),
+			'description' => t('Access the Sberbank settings page'),
+		),
+	);
+}
+
+/**
+ * Implements hook_menu().
+ */
+function uc_sberbank_menu() {
+	$items['admin/store/sberbank-config'] = array(
+		'title' => 'Sberbank configuration',
+		'page callback' => 'drupal_get_form',
+		'page arguments' => array('uc_sberbank_config'),
+		'access arguments' => array('administer sberbank'),
+		'type' => MENU_NORMAL_ITEM,
+	);
+	$items['sberbank/payment/%'] = array(
+		'title' => 'Order payment complete',
+		'page callback' => 'sberbank_register_transfer',
+		'page arguments' => array(2),
+		'access callback' => TRUE,
+		'type' => MENU_CALLBACK,
+	);
+	$items['payment/complete'] = array(
+		'title' => 'Order payment complete',
+		'page callback' => 'sberbank_response',
+		'access callback' => TRUE,
+		'type' => MENU_CALLBACK,
+	);
+	$items['payment/fail'] = array(
+		'title' => 'Unsuccessful payment',
+		'page callback' => 'sberbank_fail',
+		'access callback' => TRUE,
+		'type' => MENU_CALLBACK,
+	);
+	 $items['uc_sberbank/cron'] = array(
+			'title' => 'Sberbank Cron',
+			'page callback' => 'uc_sberbank_cron',
+			'page arguments' => array(),
+			'access arguments' => array('access cron'),
+			'type' => MENU_CALLBACK,
+    );
+	
+	return $items;
+}
+
+/**
+ * Payment method settings form.
+ */
+function uc_sberbank_config() {
+	$form['commerce_rbspayment_user_name'] = array(
+		'#type' => 'textfield',
+		'#title' => "Логин мерчанта",
+		'#default_value' => variable_get('commerce_rbspayment_user_name', ''),
+		'#required' => TRUE,
+	);
+	$form['commerce_rbspayment_password'] = array(
+		'#type' => 'textfield',
+		'#title' => "Пароль мерчанта",
+		'#default_value' => variable_get('commerce_rbspayment_password', ''),
+		'#required' => TRUE,
+	);
+	$form['commerce_rbspayment_stage'] = array(
+		'#type' => 'radios',
+		'#title' => "Стадийность платежа",
+		'#options' => array(
+			0 => "Одностадийный",
+			/*1 => "Двухстадийный"*/
+		),
+		'#default_value' => variable_get('commerce_rbspayment_stage', 0),
+		'#required' => TRUE,
+	);
+	$form['commerce_rbspayment_mode'] = array(
+		'#type' => 'radios',
+		'#title' => 'Режим работы',
+		'#default_value' => variable_get('commerce_rbspayment_mode', 0),
+		'#options' => array(
+			1 => "Тестовый",
+			0 => "Боевой"
+		),
+    '#description' => "В тестовом режиме денежные средства списываться не будут.",
+    '#required' => TRUE,
+    );
+	$form['commerce_rbspayment_logging'] = array(
+		'#type' => 'radios',
+		'#title' => 'Логирование',
+		'#default_value' => variable_get('commerce_rbspayment_logging', 0),
+		'#options' => array(
+			0 => "Нет",
+			1 => "Да"
+		),
+    '#description' => "Сообщение отправляется в системный регистратор PHP. Обычно сообщения хранятся ",
+    '#required' => TRUE,
+    );
+    return system_settings_form($form);
+}
+
+function uc_sberbank_form_alter(&$form, &$form_state, $form_id) {
+	switch($form_id) {
+		case 'uc_order_view_update_form':
+			if($form['current_status']['#value'] == 'sberbank_status'){
+				include_once('uc_sberbank.class');
+				$user_name = variable_get('commerce_rbspayment_user_name','');
+				$password = variable_get('commerce_rbspayment_password','');
+				$stage = (variable_get('commerce_rbspayment_stage', 0) == 0) ? false : true;
+				$mode = (variable_get('commerce_rbspayment_mode', 0) == 0) ? false : true;
+				$logging = (variable_get('commerce_rbspayment_logging', 0) == 0) ? false : true;
+				$rbs = new RBS($user_name, $password, $stage, $mode, $logging);
+				$response = $rbs->get_order_status_by_orderNumber($form['order_id']['#value']);
+				if($response['orderStatus'] == 2 && $response['errorCode'] == 0){
+					uc_order_update_status($response['orderNumber'], 'payment');
+					uc_order_comment_save($response['orderNumber'], 0, t('Оплата заказа прошла успешна.'), 'admin');
+					db_query("UPDATE {uc_sberbank} SET status = %d WHERE order_id = %d", 1, $form['order_id']['#value']);
+				}					
+			}
+			else {
+				$form['#submit'][] = 'uc_sberbank_submit';
+			}		
+		break;
+	}
+}
+
+function uc_sberbank_mail_alter(&$message) {
+	if($message['params']['template'] == 'sberbank') {
+		$hash = md5($message['params']['from'] . $message['params']['replacements']['order']->order_id . time() . '324sdfs44QWS34#4354sdfASD3_+@');
+		
+		$db_hash = db_result(db_query("SELECT hash FROM {uc_sberbank} WHERE order_id = %d", $message['params']['replacements']['order']->order_id));
+		
+		if(!$db_hash) {
+			db_query("INSERT INTO {uc_sberbank} (order_id, hash, status) VALUES (%d, '%s', %d)", $message['params']['replacements']['order']->order_id, $hash, 0);
+		} else {
+			$hash = $db_hash;
+		}		
+		
+		$message['body'] .= '<table width="95%" border="0" cellspacing="0" cellpadding="1" align="center" bgcolor="#FF6600" style="font-family: verdana, arial, helvetica; font-size: small;"><tbody><tr><td align="center" bgcolor="#FF6600" style="font-size: 38px;"><a style="color: #ffffff; text-decoration: none;" href="http://' .$_SERVER['SERVER_NAME'] .'/sberbank/payment/'. $hash . '">ОПЛАТИТЬ</a></td></tr></tbody></table>';		
+	}
+}
+
+function uc_sberbank_submit($form, &$form_state) {
+	if($form_state['values']['status'] == 'sberbank_status') {		
+		if(!isset($form['#parameters'][2]->primary_email) || empty($form['#parameters'][2]->primary_email)) {
+			drupal_set_message(t('The user has no email'), 'error');
+			return;
+		}		
+	}	
+}
+
+/* Зарегистрировать платеж и перенаправить пользователя на страницу оплаты*/
+function sberbank_register_transfer($hash) {	
+	if($hash){		
+		$order_id = db_result(db_query("SELECT order_id FROM {uc_sberbank} WHERE hash = '%s'", $hash));		
+
+		if($order_id) {
+			$order = uc_order_load($order_id);
+			
+			$user_name = variable_get('commerce_rbspayment_user_name','');
+			$password = variable_get('commerce_rbspayment_password','');
+			$stage = (variable_get('commerce_rbspayment_stage', 0) == 0) ? false : true;
+			$mode = (variable_get('commerce_rbspayment_mode', 0) == 0) ? false : true;
+			$logging = (variable_get('commerce_rbspayment_logging', 0) == 0) ? false : true;
+		
+			include_once('uc_sberbank.class');
+		
+			$rbs = new RBS($user_name, $password, $stage, $mode, $logging);
+			
+			$order_number = $order->order_id;
+			$amount = round($order->order_total * 100);
+			
+			$return_url = $GLOBALS['base_url'] . '/payment/complete';
+			$fail_url = $GLOBALS['base_url'] . '/payment/fail';
+		
+			$response = $rbs->register_order($order_number, $amount, $return_url, $fail_url);		
+			
+			if($response) {
+				if(!isset($response['errorCode']) && isset($response['orderId']) && isset($response['formUrl'])) {
+					db_query("UPDATE {uc_sberbank} SET url = '%s', created = %d WHERE order_id = %d", $response['formUrl'], time(), $order_id);
+					drupal_goto($response['formUrl']);					
+				} else {
+					if($response['errorCode'] == 1) {
+						$formurl = db_result(db_query("SELECT url FROM {uc_sberbank} WHERE order_id = %d", $order->order_id));		
+						drupal_goto($formurl);
+					}
+					else {
+						drupal_set_message(t('Ошибка платежной системы, свяжитесь с администратором сайта'), 'error');
+						watchdog(
+							'uc_sberbank',
+							'Sberbank payment error. Code error: @code, message: @message',
+							array('@code' => $response['errorCode'], '@message' => $response['errorMessage']), WATCHDOG_ERROR
+						);
+					}
+				}				
+			}
+		} else {
+			drupal_set_message(t('Номер заказа не найден'), 'error');
+			watchdog(
+				'uc_sberbank',
+				'Order id not found. Hash error: @code',
+				array('@code' => $hash), WATCHDOG_ERROR
+			);
+			drupal_goto('payment/fail');			
+		}
+	}
+	else{
+		drupal_set_message(t('Номер заказа не найден'), 'error');
+		watchdog(
+			'uc_sberbank',
+			'hash fiction handed.'
+		);
+		drupal_goto('payment/fail');
+	}
+}
+
+/* Успешная оплата*/
+function sberbank_response() {
+	if(isset($_GET['orderId']) && !empty($_GET['orderId'])){
+		include_once('uc_sberbank.class');
+		$user_name = variable_get('commerce_rbspayment_user_name','');
+		$password = variable_get('commerce_rbspayment_password','');
+		$stage = (variable_get('commerce_rbspayment_stage', 0) == 0) ? false : true;
+		$mode = (variable_get('commerce_rbspayment_mode', 0) == 0) ? false : true;
+		$logging = (variable_get('commerce_rbspayment_logging', 0) == 0) ? false : true;
+		$rbs = new RBS($user_name, $password, $stage, $mode, $logging);
+		$response = $rbs->get_order_status_by_orderId($_GET['orderId']);
+		
+		if($response['orderStatus'] == 2 && $response['errorCode'] == 0){
+			uc_order_update_status($response['orderNumber'], 'payment');
+			uc_order_comment_save($response['orderNumber'], 0, t('Оплата заказа прошла успешна.'), 'admin');
+			db_query("UPDATE {uc_sberbank} SET status = %d WHERE order_id = %d", 1, $response['orderNumber']);
+		}		
+		drupal_goto('payment/complete');		
+	}
+	else {
+		return '<div class="description">Оплата заказа прошла успешно</div>';
+	}
+}
+
+/* Ошибка оплаты */
+function sberbank_fail() {
+	return '<div class="description">Заказ не оплачен!</div>';	
+}
+
+function uc_sberbank_cron(){
+	include_once('uc_sberbank.class');
+	$time_live = strtotime(' - 20 min');
+	$order_id = db_query("SELECT order_id FROM {uc_sberbank} WHERE status = 0 and created >= $time_live");
+	while ($o_id = db_fetch_object($order_id)) {
+		$user_name = variable_get('commerce_rbspayment_user_name','');
+		$password = variable_get('commerce_rbspayment_password','');
+		$stage = (variable_get('commerce_rbspayment_stage', 0) == 0) ? false : true;
+		$mode = (variable_get('commerce_rbspayment_mode', 0) == 0) ? false : true;
+		$logging = (variable_get('commerce_rbspayment_logging', 0) == 0) ? false : true;
+		$rbs = new RBS($user_name, $password, $stage, $mode, $logging);
+		$response = $rbs->get_order_status_by_orderNumber($o_id->order_id);
+		if($response['orderStatus'] == 2 && $response['errorCode'] == 0){
+			uc_order_update_status($response['orderNumber'], 'payment');
+			uc_order_comment_save($response['orderNumber'], 0, t('Оплата заказа прошла успешна.'), 'admin');
+			db_query("UPDATE {uc_sberbank} SET status = %d WHERE order_id = %d", 1, $o_id->order_id);
+		}				
+	}	
+}
